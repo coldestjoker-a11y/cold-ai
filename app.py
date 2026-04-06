@@ -3,22 +3,22 @@ import re
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, send_from_directory
-from google import genai
-import anthropic
+from openai import OpenAI
+import json
+import subprocess
 
 load_dotenv()
 
 app = Flask(__name__, static_folder='.', static_url_path='')
 
 # ── API Keys ──
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# ── Gemini client ──
-gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# ── Claude client ──
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# ── OpenRouter Client ──
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
 # ──────────────────────────────────────────────────
 #  CORE INTELLIGENCE — System Prompts
@@ -479,6 +479,13 @@ Whenever someone asks you about choosing a technology, framework, language, or a
 - You explain defensive techniques alongside offensive ones
 - For medical/legal/financial advice, you provide general information with a recommendation to consult a professional
 - You respect privacy and don't ask for personal information unnecessarily
+
+## ADVANCED EXECUTION HEURISTICS
+1. Doing Tasks: Don't add features, refactor code, or make "improvements" beyond what was asked. A bug fix doesn't need surrounding code cleaned up. Don't add error handling or abstractions for hypothetical future requirements. Three similar lines of code is better than a premature abstraction.
+2. Actionable Execution: If an approach fails, diagnose why before switching tactics—read the error, check your assumptions, try a focused fix. Don't retry the identical action blindly, but don't abandon a viable approach after a single failure either.
+3. Blast Radius Awareness: Carefully consider the reversibility and blast radius of actions. For destructive operations (e.g., deleting branches, dropping tables, rm -rf) or operations visible to others (force-pushing), you MUST check with the user before proceeding.
+4. Output Efficiency: Assume users can't see your hidden reasoning - only your text output. Write user-facing text in flowing prose without unexplained jargon. Keep your text brief and direct. Lead with the answer or action, not the reasoning. Do not pack explanatory reasoning into table cells.
+5. Truthful Reporting: Report outcomes faithfully. If tests fail, say so with the relevant output. If you did not run a verification step, say that rather than implying it succeeded. Never claim "all tests pass" when output shows failures.
 """
 
 CURRENT_CONTEXT = f"""
@@ -529,33 +536,31 @@ Your responses MUST be:
 #  CONVERSATION MEMORY
 # ──────────────────────────────────────────────────
 
-# Gemini chats (have built-in memory)
-# Quick = gemini-2.0-flash (fastest), Deep = gemini-2.5-flash (smartest)
-gemini_chats = {
-    'quick': gemini_client.chats.create(model="gemini-2.0-flash"),
-    'deep': gemini_client.chats.create(model="gemini-2.5-flash"),
+# Unified OpenRouter conversation history
+chat_history = {
+    'gemini': {'quick': [], 'deep': []},
+    'claude': {'quick': [], 'deep': []},
 }
 
-# Claude conversation history (manual memory)
-claude_history = {
-    'quick': [],
-    'deep': [],
+MAX_HISTORY_QUICK = 20
+MAX_HISTORY_DEEP = 50
+
+# OpenRouter Model Selection
+OPENROUTER_MODELS = {
+    'gemini': {
+        'quick': 'google/gemini-2.5-flash',
+        'deep': 'google/gemini-2.5-flash',
+    },
+    'claude': {
+        'quick': 'anthropic/claude-3-5-haiku-20241022',
+        'deep': 'anthropic/claude-3.5-sonnet',
+    }
 }
 
-MAX_CLAUDE_HISTORY_QUICK = 20   # Shorter history = faster context
-MAX_CLAUDE_HISTORY_DEEP = 50    # Full history for deep conversations
-
-# Model selection: fastest for Quick, smartest for Deep
-CLAUDE_MODELS = {
-    'quick': 'claude-3-5-haiku-20241022',   # Fastest Claude model
-    'deep': 'claude-sonnet-4-20250514',      # Smartest Claude model
+OPENROUTER_MAX_TOKENS = {
+    'quick': 300,
+    'deep': 8192,
 }
-
-CLAUDE_MAX_TOKENS = {
-    'quick': 300,    # Short responses = faster
-    'deep': 8192,    # Full depth
-}
-
 
 # ──────────────────────────────────────────────────
 #  RESPONSE PROCESSING
@@ -568,37 +573,113 @@ def clean_response(text):
     # Remove leading/trailing whitespace
     return text.strip()
 
+from agent_tools import TOOLS, execute_bash, read_file, write_file, memorize_fact, recall_facts, analyze_code
 
-def get_gemini_reply(message, mode):
-    """Get response from Gemini with conversation memory."""
-    prompt = SYSTEM_PROMPTS[mode] + "\n\nUser: " + message
-    response = gemini_chats[mode].send_message(prompt)
-    return clean_response(response.text)
+def delegate_task(objective):
+    """Sub-agent logic that uses the master client to spawn an invisible worker."""
+    try:
+        sub_history = [
+            {"role": "system", "content": SYSTEM_PROMPTS['deep'] + "\n\n[ROLE: You are an invisible Sub-Agent. Your task is to execute the objective perfectly using your tools, and return ONLY a final summary/result to the Master Agent.]"},
+            {"role": "user", "content": objective}
+        ]
+        
+        while True:
+            response = client.chat.completions.create(
+                model="google/gemini-2.5-flash",
+                messages=sub_history,
+                tools=TOOLS
+            )
+            msg = response.choices[0].message
+            sub_history.append(msg)
+            
+            if not msg.tool_calls:
+                return f"[SUB-AGENT TASK COMPLETED]\n{msg.content}"
+                
+            for tool_call in msg.tool_calls:
+                func_name = tool_call.function.name
+                try: args = json.loads(tool_call.function.arguments)
+                except: args = {}
+                
+                if func_name == "execute_bash": res = execute_bash(args.get("command", ""))
+                elif func_name == "read_file": res = read_file(args.get("filepath", ""))
+                elif func_name == "write_file": res = write_file(args.get("filepath", ""), args.get("content", ""))
+                elif func_name == "memorize_fact": res = memorize_fact(args.get("key", ""), args.get("fact", ""))
+                elif func_name == "recall_facts": res = recall_facts()
+                elif func_name == "analyze_code": res = analyze_code(args.get("filepath", ""))
+                elif func_name == "delegate_task": res = "[ERROR: Sub-Agents cannot spawn further sub-agents.]"
+                else: res = f"Unknown tool {func_name}"
+                
+                sub_history.append({"role": "tool", "tool_call_id": tool_call.id, "name": func_name, "content": str(res)})
+    except Exception as e:
+        return f"[SUB-AGENT CRASHED]\nError: {str(e)}"
 
+def get_openrouter_reply(message, mode, provider):
+    """Get response from OpenRouter with manual conversation memory."""
+    # Get the provider history for this mode
+    history = chat_history[provider][mode]
+    
+    # If history is empty, initialize with the system prompt
+    if not history:
+        history.append({"role": "system", "content": SYSTEM_PROMPTS[mode]})
+        
+    # Add user message
+    history.append({"role": "user", "content": message})
+    
+    # Trim history (keep system prompt at index 0, trim the rest)
+    max_hist = MAX_HISTORY_QUICK if mode == 'quick' else MAX_HISTORY_DEEP
+    if len(history) > max_hist + 1:
+        # Keep system prompt, then the last (max_hist) messages
+        chat_history[provider][mode] = [history[0]] + history[-(max_hist):]
+        history = chat_history[provider][mode]
 
-def get_claude_reply(message, mode):
-    """Get response from Claude with conversation memory."""
-    # Add user message to history
-    claude_history[mode].append({"role": "user", "content": message})
+    while True:
+        response = client.chat.completions.create(
+            model=OPENROUTER_MODELS[provider][mode],
+            max_tokens=OPENROUTER_MAX_TOKENS[mode],
+            messages=history,
+            tools=TOOLS
+        )
+        
+        msg = response.choices[0].message
+        history.append(msg)
+        
+        reply = msg.content or ""
+        
+        if not msg.tool_calls:
+            break
+            
+        for tool_call in msg.tool_calls:
+            func_name = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments)
+            except:
+                args = {}
+            
+            if func_name == "execute_bash":
+                result = execute_bash(args.get("command", ""))
+            elif func_name == "read_file":
+                result = read_file(args.get("filepath", ""))
+            elif func_name == "write_file":
+                result = write_file(args.get("filepath", ""), args.get("content", ""))
+            elif func_name == "memorize_fact":
+                result = memorize_fact(args.get("key", ""), args.get("fact", ""))
+            elif func_name == "recall_facts":
+                result = recall_facts()
+            elif func_name == "analyze_code":
+                result = analyze_code(args.get("filepath", ""))
+            elif func_name == "delegate_task":
+                result = delegate_task(args.get("objective", ""))
+            else:
+                result = f"Unknown tool {func_name}"
+            
+            history.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "name": func_name,
+                "content": str(result)
+            })
 
-    # Trim history — shorter for Quick (speed), longer for Deep (context)
-    max_hist = MAX_CLAUDE_HISTORY_QUICK if mode == 'quick' else MAX_CLAUDE_HISTORY_DEEP
-    if len(claude_history[mode]) > max_hist:
-        claude_history[mode] = claude_history[mode][-max_hist:]
-
-    response = claude_client.messages.create(
-        model=CLAUDE_MODELS[mode],
-        max_tokens=CLAUDE_MAX_TOKENS[mode],
-        system=SYSTEM_PROMPTS[mode],
-        messages=claude_history[mode]
-    )
-
-    reply = clean_response(response.content[0].text)
-
-    # Add assistant reply to history
-    claude_history[mode].append({"role": "assistant", "content": reply})
-
-    return reply
+    return clean_response(reply)
 
 
 # ──────────────────────────────────────────────────
@@ -622,32 +703,26 @@ def chat_endpoint():
 
     if mode not in ('quick', 'deep'):
         mode = 'quick'
+        
+    if provider not in ('gemini', 'claude'):
+        provider = 'gemini'
 
     try:
-        if provider == 'claude':
-            reply = get_claude_reply(user_message, mode)
-        else:
-            reply = get_gemini_reply(user_message, mode)
-
+        reply = get_openrouter_reply(user_message, mode, provider)
         return jsonify({'reply': reply})
     except Exception as e:
         print(f"[ERROR] {provider}/{mode}: {e}")
-        return jsonify({'error': f'Something went wrong with {provider}. Please try again.'}), 500
+        return jsonify({'error': f'Something went wrong with OpenRouter ({provider}). Please try again.'}), 500
 
 
 @app.route('/clear', methods=['POST'])
 def clear_endpoint():
     """Reset conversation memory for all providers."""
-    global gemini_chats, claude_history
-
-    # Reset Gemini chats (quick=fast model, deep=smart model)
-    gemini_chats['quick'] = gemini_client.chats.create(model="gemini-2.0-flash")
-    gemini_chats['deep'] = gemini_client.chats.create(model="gemini-2.5-flash")
-
-    # Reset Claude history
-    claude_history['quick'] = []
-    claude_history['deep'] = []
-
+    global chat_history
+    chat_history = {
+        'gemini': {'quick': [], 'deep': []},
+        'claude': {'quick': [], 'deep': []},
+    }
     return jsonify({'status': 'cleared'})
 
 
@@ -657,8 +732,7 @@ def health():
     return jsonify({
         'status': 'ok',
         'providers': {
-            'gemini': bool(GEMINI_API_KEY),
-            'claude': bool(ANTHROPIC_API_KEY),
+            'openrouter': bool(OPENROUTER_API_KEY),
         },
         'timestamp': datetime.now().isoformat()
     })
@@ -669,7 +743,6 @@ if __name__ == '__main__':
     print("  Cold AI — Chat Server")
     print("  http://localhost:5000")
     print("=" * 50)
-    print(f"  Gemini API: {'[OK] Connected' if GEMINI_API_KEY else '[X] Missing'}")
-    print(f"  Claude API: {'[OK] Connected' if ANTHROPIC_API_KEY else '[X] Missing'}")
+    print(f"  OpenRouter API: {'[OK] Connected' if OPENROUTER_API_KEY else '[X] Missing'}")
     print("=" * 50)
     app.run(debug=True, port=5000)
