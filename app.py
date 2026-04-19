@@ -6,6 +6,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from openai import OpenAI
 import json
 import subprocess
+import chat_history_db as db
 
 load_dotenv()
 
@@ -613,35 +614,37 @@ def delegate_task(objective):
     except Exception as e:
         return f"[SUB-AGENT CRASHED]\nError: {str(e)}"
 
-def get_openrouter_reply(message, mode, provider):
-    """Get response from OpenRouter with manual conversation memory."""
-    # Get the provider history for this mode
+def get_openrouter_reply(message, mode, provider, conv_id=None):
+    """Get response from OpenRouter with persistent conversation memory."""
+    # Build message history from DB if a conversation ID is provided
+    if conv_id:
+        past_messages = db.get_messages_for_api(conv_id)
+    else:
+        past_messages = []
+
+    # Also maintain in-memory history for this session (for tool calls)
     history = chat_history[provider][mode]
-    
-    # If history is empty, initialize with the system prompt
-    if not history:
-        history.append({"role": "system", "content": SYSTEM_PROMPTS[mode]})
-        
-    # Add user message
-    history.append({"role": "user", "content": message})
-    
-    # Trim history (keep system prompt at index 0, trim the rest)
+
+    # Build the full message list for the API call
+    api_messages = [{"role": "system", "content": SYSTEM_PROMPTS[mode]}]
+    api_messages.extend(past_messages)
+    api_messages.append({"role": "user", "content": message})
+
+    # Trim to fit context window (keep system prompt + last N messages)
     max_hist = MAX_HISTORY_QUICK if mode == 'quick' else MAX_HISTORY_DEEP
-    if len(history) > max_hist + 1:
-        # Keep system prompt, then the last (max_hist) messages
-        chat_history[provider][mode] = [history[0]] + history[-(max_hist):]
-        history = chat_history[provider][mode]
+    if len(api_messages) > max_hist + 1:
+        api_messages = [api_messages[0]] + api_messages[-(max_hist):]
 
     while True:
         response = client.chat.completions.create(
             model=OPENROUTER_MODELS[provider][mode],
             max_tokens=OPENROUTER_MAX_TOKENS[mode],
-            messages=history,
+            messages=api_messages,
             tools=TOOLS
         )
         
         msg = response.choices[0].message
-        history.append(msg)
+        api_messages.append(msg)
         
         reply = msg.content or ""
         
@@ -672,7 +675,7 @@ def get_openrouter_reply(message, mode, provider):
             else:
                 result = f"Unknown tool {func_name}"
             
-            history.append({
+            api_messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "name": func_name,
@@ -697,6 +700,7 @@ def chat_endpoint():
     user_message = data.get('message', '').strip()
     mode = data.get('mode', 'quick')
     provider = data.get('provider', 'gemini')
+    conv_id = data.get('conversation_id', None)
 
     if not user_message:
         return jsonify({'error': 'Empty message'}), 400
@@ -707,9 +711,27 @@ def chat_endpoint():
     if provider not in ('gemini', 'claude'):
         provider = 'gemini'
 
+    # Auto-create a conversation if none provided
+    if not conv_id:
+        conv_id = db.create_conversation(provider, mode)
+
+    # Save the user message to the database
+    db.save_message(conv_id, 'user', user_message, provider, mode)
+
     try:
-        reply = get_openrouter_reply(user_message, mode, provider)
-        return jsonify({'reply': reply})
+        reply = get_openrouter_reply(user_message, mode, provider, conv_id)
+
+        # Save the assistant reply to the database
+        db.save_message(conv_id, 'assistant', reply, provider, mode)
+
+        # Get the updated conversation metadata (for auto-title)
+        conv = db.get_conversation(conv_id)
+
+        return jsonify({
+            'reply': reply,
+            'conversation_id': conv_id,
+            'conversation_title': conv['title'] if conv else 'New Chat'
+        })
     except Exception as e:
         print(f"[ERROR] {provider}/{mode}: {e}")
         return jsonify({'error': f'Something went wrong with OpenRouter ({provider}). Please try again.'}), 500
@@ -724,6 +746,69 @@ def clear_endpoint():
         'claude': {'quick': [], 'deep': []},
     }
     return jsonify({'status': 'cleared'})
+
+
+# ──────────────────────────────────────────────────
+#  CHAT HISTORY API
+# ──────────────────────────────────────────────────
+
+@app.route('/conversations', methods=['GET'])
+def list_conversations():
+    """List all saved conversations."""
+    conversations = db.list_conversations()
+    return jsonify({'conversations': conversations})
+
+
+@app.route('/conversations', methods=['POST'])
+def create_conversation():
+    """Create a new empty conversation."""
+    data = request.get_json() or {}
+    provider = data.get('provider', 'gemini')
+    mode = data.get('mode', 'quick')
+    conv_id = db.create_conversation(provider, mode)
+    return jsonify({'conversation_id': conv_id})
+
+
+@app.route('/conversations/<conv_id>', methods=['GET'])
+def get_conversation(conv_id):
+    """Get a conversation with all its messages."""
+    conv = db.get_conversation(conv_id)
+    if not conv:
+        return jsonify({'error': 'Conversation not found'}), 404
+    messages = db.get_messages(conv_id)
+    return jsonify({'conversation': conv, 'messages': messages})
+
+
+@app.route('/conversations/<conv_id>', methods=['DELETE'])
+def delete_conversation(conv_id):
+    """Delete a conversation."""
+    db.delete_conversation(conv_id)
+    return jsonify({'status': 'deleted'})
+
+
+@app.route('/conversations/<conv_id>/rename', methods=['POST'])
+def rename_conversation(conv_id):
+    """Rename a conversation."""
+    data = request.get_json()
+    new_title = data.get('title', '').strip()
+    if not new_title:
+        return jsonify({'error': 'Title cannot be empty'}), 400
+    db.rename_conversation(conv_id, new_title)
+    return jsonify({'status': 'renamed', 'title': new_title})
+
+
+@app.route('/conversations/<conv_id>/messages', methods=['GET'])
+def get_conversation_messages(conv_id):
+    """Get messages for a conversation."""
+    messages = db.get_messages(conv_id)
+    return jsonify({'messages': messages})
+
+
+@app.route('/history/clear', methods=['POST'])
+def clear_history():
+    """Clear ALL chat history."""
+    db.clear_all()
+    return jsonify({'status': 'all_history_cleared'})
 
 
 @app.route('/health')
