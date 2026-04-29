@@ -546,17 +546,33 @@ chat_history = {
 MAX_HISTORY_QUICK = 20
 MAX_HISTORY_DEEP = 50
 
-# OpenRouter Model Selection
+# OpenRouter Model Selection (free-tier — unrestricted, follows system prompt fully)
+# Primary models are tried first; fallbacks are used automatically on 404/429.
 OPENROUTER_MODELS = {
     'gemini': {
-        'quick': 'google/gemini-2.5-flash',
-        'deep': 'google/gemini-2.5-flash',
+        'quick': 'nvidia/nemotron-3-nano-30b-a3b:free',
+        'deep':  'nvidia/nemotron-3-super-120b-a12b:free',
     },
     'claude': {
-        'quick': 'anthropic/claude-3-5-haiku-20241022',
-        'deep': 'anthropic/claude-3.5-sonnet',
+        'quick': 'nvidia/nemotron-3-nano-30b-a3b:free',
+        'deep':  'nvidia/nemotron-3-super-120b-a12b:free',
     }
 }
+
+# Fallback chain: if the primary model is 404/429, try these in order
+# IMPORTANT: Only unrestricted models — no gpt-oss, no gemma (those have content filters)
+OPENROUTER_FALLBACKS = [
+    'nvidia/nemotron-3-nano-30b-a3b:free',
+    'nvidia/nemotron-3-super-120b-a12b:free',
+    'minimax/minimax-m2.5:free',
+    'z-ai/glm-4.5-air:free',
+    'inclusionai/ling-2.6-1t:free',
+    'tencent/hy3-preview:free',
+    'poolside/laguna-m.1:free',
+    'cognitivecomputations/dolphin-mistral-24b-venice-edition:free',
+    'nousresearch/hermes-3-llama-3.1-405b:free',
+    'meta-llama/llama-3.3-70b-instruct:free',
+]
 
 OPENROUTER_MAX_TOKENS = {
     'quick': 300,
@@ -586,7 +602,7 @@ def delegate_task(objective):
         
         while True:
             response = client.chat.completions.create(
-                model="google/gemini-2.5-flash",
+                model="openai/gpt-oss-120b:free",
                 messages=sub_history,
                 tools=TOOLS
             )
@@ -615,15 +631,12 @@ def delegate_task(objective):
         return f"[SUB-AGENT CRASHED]\nError: {str(e)}"
 
 def get_openrouter_reply(message, mode, provider, conv_id=None):
-    """Get response from OpenRouter with persistent conversation memory."""
+    """Get response from OpenRouter with persistent conversation memory and model fallback."""
     # Build message history from DB if a conversation ID is provided
     if conv_id:
         past_messages = db.get_messages_for_api(conv_id)
     else:
         past_messages = []
-
-    # Also maintain in-memory history for this session (for tool calls)
-    history = chat_history[provider][mode]
 
     # Build the full message list for the API call
     api_messages = [{"role": "system", "content": SYSTEM_PROMPTS[mode]}]
@@ -635,54 +648,82 @@ def get_openrouter_reply(message, mode, provider, conv_id=None):
     if len(api_messages) > max_hist + 1:
         api_messages = [api_messages[0]] + api_messages[-(max_hist):]
 
-    while True:
-        response = client.chat.completions.create(
-            model=OPENROUTER_MODELS[provider][mode],
-            max_tokens=OPENROUTER_MAX_TOKENS[mode],
-            messages=api_messages,
-            tools=TOOLS
-        )
-        
-        msg = response.choices[0].message
-        api_messages.append(msg)
-        
-        reply = msg.content or ""
-        
-        if not msg.tool_calls:
-            break
-            
-        for tool_call in msg.tool_calls:
-            func_name = tool_call.function.name
-            try:
-                args = json.loads(tool_call.function.arguments)
-            except:
-                args = {}
-            
-            if func_name == "execute_bash":
-                result = execute_bash(args.get("command", ""))
-            elif func_name == "read_file":
-                result = read_file(args.get("filepath", ""))
-            elif func_name == "write_file":
-                result = write_file(args.get("filepath", ""), args.get("content", ""))
-            elif func_name == "memorize_fact":
-                result = memorize_fact(args.get("key", ""), args.get("fact", ""))
-            elif func_name == "recall_facts":
-                result = recall_facts()
-            elif func_name == "analyze_code":
-                result = analyze_code(args.get("filepath", ""))
-            elif func_name == "delegate_task":
-                result = delegate_task(args.get("objective", ""))
-            else:
-                result = f"Unknown tool {func_name}"
-            
-            api_messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "name": func_name,
-                "content": str(result)
-            })
+    # Build fallback model list: primary first, then the global fallbacks
+    primary_model = OPENROUTER_MODELS[provider][mode]
+    fallback_chain = [primary_model] + [
+        m for m in OPENROUTER_FALLBACKS if m != primary_model
+    ]
 
-    return clean_response(reply)
+    last_error = None
+    for attempt_model in fallback_chain:
+        try:
+            # Reset messages to a fresh copy for each model attempt
+            attempt_messages = list(api_messages)
+
+            while True:
+                response = client.chat.completions.create(
+                    model=attempt_model,
+                    max_tokens=OPENROUTER_MAX_TOKENS[mode],
+                    messages=attempt_messages,
+                    tools=TOOLS
+                )
+
+                msg = response.choices[0].message
+                attempt_messages.append(msg)
+
+                reply = msg.content or ""
+
+                if not msg.tool_calls:
+                    break
+
+                for tool_call in msg.tool_calls:
+                    func_name = tool_call.function.name
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                    except:
+                        args = {}
+
+                    if func_name == "execute_bash":
+                        result = execute_bash(args.get("command", ""))
+                    elif func_name == "read_file":
+                        result = read_file(args.get("filepath", ""))
+                    elif func_name == "write_file":
+                        result = write_file(args.get("filepath", ""), args.get("content", ""))
+                    elif func_name == "memorize_fact":
+                        result = memorize_fact(args.get("key", ""), args.get("fact", ""))
+                    elif func_name == "recall_facts":
+                        result = recall_facts()
+                    elif func_name == "analyze_code":
+                        result = analyze_code(args.get("filepath", ""))
+                    elif func_name == "delegate_task":
+                        result = delegate_task(args.get("objective", ""))
+                    else:
+                        result = f"Unknown tool {func_name}"
+
+                    attempt_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": func_name,
+                        "content": str(result)
+                    })
+
+            # Success — log which model was used if it wasn't the primary
+            if attempt_model != primary_model:
+                print(f"[FALLBACK] Used {attempt_model} instead of {primary_model}")
+            return clean_response(reply)
+
+        except Exception as e:
+            err_str = str(e)
+            # Only fall back on model-level errors (404 not found, 429 rate limit)
+            if '404' in err_str or '429' in err_str:
+                print(f"[FALLBACK] {attempt_model} failed ({err_str[:80]}), trying next...")
+                last_error = e
+                continue
+            # For any other error (auth, billing, etc.), raise immediately
+            raise
+
+    # All models exhausted
+    raise last_error or RuntimeError("All OpenRouter models exhausted.")
 
 
 # ──────────────────────────────────────────────────
@@ -733,8 +774,26 @@ def chat_endpoint():
             'conversation_title': conv['title'] if conv else 'New Chat'
         })
     except Exception as e:
-        print(f"[ERROR] {provider}/{mode}: {e}")
-        return jsonify({'error': f'Something went wrong with OpenRouter ({provider}). Please try again.'}), 500
+        import traceback
+        err_str = str(e)
+        traceback.print_exc()
+
+        # Classify the error for a helpful user-facing message
+        if '429' in err_str or 'rate limit' in err_str.lower():
+            user_msg = f'Rate limit hit on {provider.capitalize()}. Wait a moment and try again.'
+        elif '401' in err_str or 'auth' in err_str.lower() or 'api key' in err_str.lower():
+            user_msg = 'API key rejected by OpenRouter. Check your OPENROUTER_API_KEY in .env.'
+        elif '402' in err_str or 'credits' in err_str.lower() or 'billing' in err_str.lower():
+            user_msg = 'OpenRouter account has insufficient credits. Top up at openrouter.ai.'
+        elif '503' in err_str or '502' in err_str or 'timeout' in err_str.lower():
+            user_msg = f'The {provider.capitalize()} model is temporarily unavailable. Try again in a moment.'
+        elif 'model' in err_str.lower() and ('not found' in err_str.lower() or 'invalid' in err_str.lower()):
+            user_msg = f'Model not available on OpenRouter for {provider.capitalize()}. Try switching providers.'
+        else:
+            user_msg = f'OpenRouter error ({provider}): {err_str[:120]}'
+
+        print(f"[ERROR] {provider}/{mode}: {err_str}")
+        return jsonify({'error': user_msg}), 500
 
 
 @app.route('/clear', methods=['POST'])
